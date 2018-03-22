@@ -127,16 +127,19 @@ class Importer
             $blog_post->write();
             $blog_post->doPublish();
 
+
             $comments = $orig->Comments;
             foreach($comments as $commentData) {
                 $comment = new Comment();
+                $comment->Email = $commentData->Email;
                 $comment->Name = $commentData->Name;
                 $comment->URL = $commentData->URL;
-                $comment->Content = $commentData->Content;
+                $comment->Comment = $commentData->Content;
                 $comment->ParentID = $blog_post->ID;
-          //      $comment->write();
+                $comment->ParentClass = 'SilverStripe\Blog\Model\BlogPost';
+                $comment->write();
 
-                error_log('... saved comment from ' . $comment->Email);
+                error_log('Comment on ' . $comment->ID . ' by ' . $comment->Email);
             }
 
             /*
