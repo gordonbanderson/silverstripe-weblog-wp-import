@@ -1,3 +1,8 @@
+#HACK, DO NOT USE
+Original version below, I hacked it to import WordPress comments for testing purposes
+
+
+
 # WordPress Importer for SilverStripe Weblog
 
 A module to import WordPress XML into [SilverStripe Weblog](https://github.com/axllent/silverstripe-weblog).
