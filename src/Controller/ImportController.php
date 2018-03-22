@@ -2,15 +2,14 @@
 
 namespace Axllent\WeblogWPImport\Control;
 
-use Axllent\Weblog\Model\Blog;
-use Axllent\Weblog\Model\BlogCategory;
-use Axllent\Weblog\Model\BlogPost;
 use Axllent\WeblogWPImport\Lib\WPXMLParser;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 use SilverStripe\Assets\File;
 use SilverStripe\Assets\FileNameFilter;
 use SilverStripe\Assets\Image;
+use SilverStripe\Blog\Model\Blog;
+use SilverStripe\Blog\Model\BlogPost;
 use SilverStripe\CMS\Model\SiteTree;
 use SilverStripe\Control\Controller;
 use SilverStripe\Control\Session;
@@ -97,6 +96,8 @@ class ImportController extends Controller
 
     public function UploadForm()
     {
+        error_log('Upload form');
+
         if (!extension_loaded('simplexml')) {
             return DBHTMLText::create()
                 ->setValue('<p class="message error">This module requires PHP with simplexml</p>');
@@ -132,6 +133,8 @@ class ImportController extends Controller
 
     public function OptionsForm()
     {
+        error_log('Options form');
+
         $options = [
             'remove_styles_and_classes' => 'Remove all styles & classes',
             'remove_shortcodes' => 'Remove unparsed WordPress shortcodes after all filters',
@@ -202,6 +205,8 @@ class ImportController extends Controller
 
     public function ProcessImport($data, $form)
     {
+        error_log('Processing import');
+
         $form->setSessionData($data);
         $this->session->set('WPImportFieldsSelected', 'true');
 
