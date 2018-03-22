@@ -3,12 +3,14 @@
 namespace Axllent\WeblogWPImport\Control;
 
 use Axllent\WeblogWPImport\Lib\WPXMLParser;
+use Axllent\WeblogWPImport\Service\Importer;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 use SilverStripe\Assets\File;
 use SilverStripe\Assets\FileNameFilter;
 use SilverStripe\Assets\Image;
 use SilverStripe\Blog\Model\Blog;
+use SilverStripe\Blog\Model\BlogCategory;
 use SilverStripe\Blog\Model\BlogPost;
 use SilverStripe\CMS\Model\SiteTree;
 use SilverStripe\Control\Controller;
@@ -210,12 +212,16 @@ class ImportController extends Controller
         $form->setSessionData($data);
         $this->session->set('WPImportFieldsSelected', 'true');
 
-        $import = $this->getImportData();
+        $importer = new Importer();
 
-        if (!$import) {
+        $xml = $this->session->get('WPExport');
+        if (!$xml) {
             $form->sessionMessage('No valid data found');
-            return $this->redirectBack();
+            return false;
+        } else {
+            $importer->getImportData($xml);
         }
+
 
         $process_categories = !empty($data['WPImportOptions']['categories']) ? : false;
         $overwrite = !empty($data['WPImportOptions']['overwrite']) ? true : false;
@@ -231,19 +237,7 @@ class ImportController extends Controller
         $blog = $this->getBlog();
 
         if ($process_categories) {
-            $categories_created = 0;
-            /* Check all categories exist */
-            foreach ($import->Categories as $category) {
-                $cat = $blog->Categories()->filter('Title', $category->Title)->first();
-                if (!$cat) {
-                    $cat = BlogCategory::create([
-                        'Title' => $category->Title
-                    ]);
-                    $blog->Categories()->add($cat);
-                    $categories_created++;
-                }
-            }
-            $status[] = $categories_created . ' categories created';
+            $status = $importer->processCategories($blog, $status);
         }
 
         // Counters for form return
@@ -251,347 +245,7 @@ class ImportController extends Controller
         $blog_posts_updated = 0;
         $assets_downloaded = 0;
 
-        $this->featured_image_folder = Config::inst()->get('Axllent\\Weblog\\Model\\BlogPost', 'featured_image_folder');
-
-        foreach ($import->Posts as $orig) {
-            $blog_post = BlogPost::get()->filter('URLSegment', $orig->URLSegment)->first();
-            if ($blog_post && !$overwrite) {
-                continue;
-            }
-
-            if (!$blog_post) {
-                $blog_post = BlogPost::create([
-                    'URLSegment' => $orig->URLSegment
-                ]);
-                $blog_posts_added++;
-            } else {
-                $blog_posts_updated++;
-            }
-
-            $blog_post->Title = $orig->Title;
-            $blog_post->PublishDate = $orig->PublishDate;
-            $blog_post->ParentID = $blog->ID;
-            $blog_post->HasBrokenLink = 0;
-            $blog_post->HasBrokenFile = 0;
-
-            // Now we parse the hell out of the content
-            $content = $orig->Content;
-
-            // Format WordPress code
-            $content = $this->wpautop($content);
-
-            if ($import_filters) {
-                foreach ($import_filters as $fcn) {
-                    $html_fcn = 'html_' . $fcn;
-                    if (ClassInfo::hasMethod($this, $html_fcn)) {
-                        $content = $this->$html_fcn($content, $data);
-                    }
-                }
-            }
-
-            $dom = SimpleHtmlDom\str_get_html(
-                $content,
-                $lowercase=true,
-                $forceTagsClosed=true,
-                $target_charset = 'UTF-8',
-                $stripRN=false
-            );
-
-            if ($dom) {
-                if ($remove_styles_and_classes) {
-                    // remove all styles
-                    foreach ($dom->find('*[style]') as $el) {
-                        $el->style = false;
-                    }
-                    // remove all classes except for images
-                    foreach ($dom->find('*[class]') as $el) {
-                        if ($el->tag != 'img') {
-                            $el->class = false;
-                        }
-                    }
-                }
-
-                /**
-                 * IMAGES
-                 * Downloads hosted images and sets SilverStrypoe classes
-                 * leftAlone|center|left|right ss-htmleditorfield-file image
-                 */
-                foreach ($dom->find('img') as $img) {
-                    if ($class = $img->class) {
-                        if (preg_match('/\bplaceholder\b/', $class)) {
-                            // ignore - media
-                        } elseif (preg_match('/\balignright\b/', $class)) {
-                            $img->class = 'right ss-htmleditorfield-file image';
-                        } elseif (preg_match('/\balignleft\b/', $class)) {
-                            $img->class = 'left ss-htmleditorfield-file image';
-                        } elseif (preg_match('/\baligncenter\b/', $class)) {
-                            $img->class = 'center ss-htmleditorfield-file image';
-                        } else {
-                            $img->class = 'leftAlone ss-htmleditorfield-file image';
-                        }
-                    } else {
-                        $img->class = false;
-                    }
-
-                    /* Import Images */
-                    $orig_src = $img->src;
-                    if (!$orig_src) {
-                        continue;
-                    }
-
-                    $parts = parse_url($orig_src);
-                    if (empty($parts['path'])) {
-                        continue;
-                    }
-
-                    if (!preg_match('/^' . preg_quote($import->SiteURL, '/') . '/', $orig_src)) {
-                        continue; // don't download remote images - too problematic re: filenames
-                    }
-
-                    $orig_src = rtrim($import->SiteURL, '/') . $parts['path'];
-
-                    $non_scaled = preg_replace('/^(.*)(\-\d\d\d?\d?x\d\d\d?\d?)\.([a-z]{3,4})$/', '${1}.${3}', $orig_src);
-
-                    $file_name = @pathinfo($non_scaled, PATHINFO_BASENAME);
-                    $nameFilter = FileNameFilter::create();
-                    $file_name = $nameFilter->filter($file_name);
-
-                    if (!$file_name) {
-                        $blog_post->HasBrokenFile = 1;
-                        continue;
-                    }
-
-                    $file = Image::get()->filter('FileFilename', $this->featured_image_folder .'/' . $file_name)->first();
-                    if (!$file) {
-                        // Download asset
-                        $data = $this->getRemoteFile($non_scaled);
-
-                        if (!$data) {
-                            if ($non_scaled != $orig_src) {
-                                // Try download the image directly (maybe scaling params are in the original filename?)
-                                $data = $this->getRemoteFile($orig_src);
-                            }
-                            if (!$data) {
-                                // Create a a broken image
-                                $new_tag = '[image src="' . $orig_src . '" id="0"';
-                                if ($v = $img->width) {
-                                    $new_tag .= ' width="' . $v .'"';
-                                }
-                                if ($v = $img->height) {
-                                    $new_tag .= ' height="' . $v .'"';
-                                }
-                                $new_tag .= ' class="' . $img->class .'"';
-                                $new_tag .= ' alt="' . $img->alt .'"';
-                                if ($v = $img->title) {
-                                    $new_tag .= ' title="' . $img->title .'"';
-                                }
-                                $new_tag .= ']';
-                                $img->outertext = $new_tag;
-                                $blog_post->HasBrokenFile = 1;
-                                continue; // 404
-                            }
-                        }
-
-                        $assets_downloaded++;
-
-                        $file = new Image();
-                        $file->setFromString($data, $this->featured_image_folder .'/' . $file_name);
-                        if ($img->title) {
-                            // $file->Name = $file_name;
-                            $file->Title = $img->title;
-                        } elseif ($img->alt) {
-                            // $file->Name = $file_name;
-                            $file->Title = $img->alt;
-                        }
-                        $file->write();
-                        $file->doPublish();
-                    }
-
-                    if ($file) {
-                        // Manually create shortcode
-                        $img_width = $img->width ? $img->width : false;
-                        $img_height = $img->height ? $img->height : false;
-
-                        // Rescale if set & image is large enough and options set
-                        $src_width = $file->getWidth();
-                        $src_height = $file->getHeight();
-                        if ($set_image_width && $file->getWidth() >= $set_image_width) {
-                            $ratio = $src_width / $src_height;
-                            $img_width = $set_image_width;
-                            $img_height = round($set_image_width / $ratio);
-                        }
-
-                        $src = $file->Link();
-                        $new_tag = '[image src="' . $src . '" id="' . $file->ID . '"';
-                        if ($img_width) {
-                            $new_tag .= ' width="' . $img_width .'"';
-                        }
-                        if ($img_height) {
-                            $new_tag .= ' height="' . $img_height .'"';
-                        }
-                        $new_tag .= ' class="' . $img->class .'"';
-                        $new_tag .= ' alt="' . $img->alt .'"';
-                        if ($v = $img->title) {
-                            $new_tag .= ' title="' . $img->title .'"';
-                        }
-                        $new_tag .= ']';
-                        $img->outertext = $new_tag;
-                    }
-                }
-
-                /**
-                 * Internal LINKS
-                 * Re-link internal links where possible
-                 * downloading resources where necessary
-                 */
-                foreach ($dom->find('a[href^=' . $import->SiteURL . ']') as $a) {
-                    if ($href = $a->href) {
-                        $parts = parse_url($href);
-
-                        $link_file = @pathinfo($parts['path'], PATHINFO_BASENAME);
-
-                        if ($link_file == '') { // home link
-                            $link_file = 'home';
-                        }
-
-                        /* Set link to broken unless we find it */
-                        $a->href = '[sitetree_link,id=0]';
-                        $a->class = 'ss-broken';
-
-                        /* Try match to SiteTree */
-                        if (!empty($urlsegment_link_rewrite[$link_file])) {
-                            $sitetree_urlsegment = $urlsegment_link_rewrite[$link_file];
-                        } else {
-                            $sitetree_urlsegment = $link_file;
-                        }
-                        $page = SiteTree::get()->filter('URLSegment', $sitetree_urlsegment)->first();
-
-                        if ($page) {
-                            $a->href = '[sitetree_link,id=' . $page->ID. ']';
-                            $a->class = false;
-                            $a->target = false;
-                            $a->title = false;
-                            continue;
-                        }
-
-                        /* Try match to a file */
-                        $nameFilter = FileNameFilter::create();
-                        $file_name = $nameFilter->filter($link_file);
-
-                        $has_ext = preg_match('/\.([a-z0-9]{3,4})$/i', $file_name, $matches);
-
-                        if (!$has_ext) {
-                            $blog_post->HasBrokenLink = 1;
-                            continue; // No extension - not a File
-                        }
-
-                        $ext = strtolower($matches[1]);
-
-                        $file = File::get()->filter('Name', $file_name)->first();
-
-                        if (!$file) {
-                            $data = $this->getRemoteFile($href);
-
-                            if (!$data) { // 404
-                                $a->href = '[file_link,id=0]';
-                                $a->class = 'ss-broken';
-                                $blog_post->HasBrokenFile = 1;
-                                continue;
-                            }
-
-                            $assets_downloaded++;
-
-                            /* Create image if image */
-                            if (in_array($ext, ['gif', 'jpeg', 'jpg', 'png', 'bmp'])) {
-                                $file = new Image();
-                            } else {
-                                $file = new File();
-                            }
-
-                            $file->setFromString($data, $this->featured_image_folder .'/' . $file_name);
-                            $file->write();
-                            $file->doPublish();
-                        }
-                        if ($file) {
-                            // re-link to file
-                            $a->href = '[file_link,id=' . $file->ID . ']';
-                            $a->class = false;
-                        }
-                    }
-                }
-
-                $content = trim($dom->save());
-            }
-
-            /**
-             * Remove shortcodes
-             */
-            if ($remove_shortcodes) {
-                $content = $this->html_remove_shortcodes($content);
-            }
-
-            $blog_post->Content = $content;
-
-            /**
-             * Scrape original site for Featured Images
-             */
-            if ($scrape_for_featured_images && !$blog_post->FeaturedImage()->exists()) {
-                $remote_html = $this->getRemoteFile($orig->Link);
-                if ($remote_html && $dom = SimpleHtmlDom\str_get_html(
-                    $remote_html,
-                    $lowercase=true,
-                    $forceTagsClosed=true,
-                    $target_charset = 'UTF-8',
-                    $stripRN=false
-                )) {
-                    // Find the last meta[property=og:image] as some sites also include the author's image
-                    if ($img = $dom->find('meta[property=og:image]', -1)) {
-                        $featured_image_src = $img->content;
-
-                        $file_name = @pathinfo($featured_image_src, PATHINFO_BASENAME);
-                        $nameFilter = FileNameFilter::create();
-                        $file_name = $nameFilter->filter($file_name);
-
-                        if (!$file_name) {
-                            continue;
-                        }
-
-                        $file = Image::get()->filter('FileFilename', $this->featured_image_folder .'/' . $file_name)->first();
-                        if (!$file) {
-                            $data = $this->getRemoteFile($featured_image_src);
-                            if (!$data) {
-                                continue; // 404
-                            }
-                            $assets_downloaded++;
-                            $file = new Image();
-                            $file->setFromString($data, $this->featured_image_folder .'/' . $file_name);
-                            $file->write();
-                            $file->doPublish();
-                        }
-
-                        if ($file) {
-                            $blog_post->FeaturedImageID = $file->ID;
-                        }
-                    }
-                }
-            }
-
-            $blog_post->write();
-            $blog_post->doPublish();
-
-            // Add categories
-            if ($process_categories) {
-                $categories = $orig->Categories;
-                foreach ($categories as $category) {
-                    if (!$blog_post->Categories()->filter('Title', $category->Title)->first()) {
-                        $cat_obj = $blog_post->Parent()->Categories()->filter('Title', $category->Title)->first();
-                        if ($cat_obj->exists()) {
-                            $blog_post->Categories()->add($cat_obj);
-                        }
-                    }
-                }
-            }
-        }
+        list($blog_posts_added, $blog_posts_updated, $assets_downloaded) = $this->importPosts($data, $import, $overwrite, $blog_posts_added, $blog_posts_updated, $blog, $import_filters, $remove_styles_and_classes, $assets_downloaded, $set_image_width, $urlsegment_link_rewrite, $matches, $remove_shortcodes, $scrape_for_featured_images, $process_categories);
 
         $status[] = $blog_posts_added . ' posts added';
 
@@ -654,39 +308,7 @@ class ImportController extends Controller
         return $this->redirect(self::$url_segment . '/options/');
     }
 
-    public function getImportData()
-    {
-        $xml = $this->session->get('WPExport');
-        if (!$xml) {
-            return false;
-        }
-        $parser = new WPXMLParser($xml);
 
-        $data = $parser->XML2Data();
-        if (!$data) {
-            return false;
-        }
-
-        $categories_lookup = [];
-        $categories = ArrayList::create();
-        foreach ($data->Posts as $post) {
-            foreach ($post->Categories as $cat) { //}$url => $title) {
-                if (!isset($categories_lookup[$cat->URLSegment])) {
-                    $categories_lookup[$cat->URLSegment] = $cat->Title;
-                    $categories->push(ArrayData::create([
-                        'URLSegment' => $cat->URLSegment,
-                        'Title' => $cat->Title
-                    ]));
-                }
-            }
-        }
-
-        return ArrayData::create([
-            'SiteURL' => $data->SiteURL,
-            'Posts' => $data->Posts->filter('Status', 'publish'),
-            'Categories' => $categories
-        ]);
-    }
 
     /**
      * HTTP wrapper
@@ -720,4 +342,8 @@ class ImportController extends Controller
 
         return $body;
     }
+
+
+
+
 }
